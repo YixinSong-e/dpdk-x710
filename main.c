@@ -18,7 +18,12 @@
 #define NUM_MBUFS 10000
 #define MBUF_CACHE_SIZE 250
 #define BURST_SIZE 8
-
+#define ARRAY_LENGTH 10000000
+#define SEND_PPS 300000000
+#define GENTIME (1000000000 / SEND_PPS)
+uint64_t rx_time[ARRAY_LENGTH];
+FILE *fp;
+uint64_t t1,t2;
 //这里用skleten 默认配置
 static const struct rte_eth_conf port_conf_default = {
 	.rxmode = { .max_lro_pkt_size = RTE_ETHER_MAX_LEN }
@@ -46,7 +51,7 @@ static inline int
 port_init(struct rte_mempool *mbuf_pool)
 {
 	struct rte_eth_conf port_conf = port_conf_default;
-	const uint16_t rx_rings = 1, tx_rings = 1;
+	const uint16_t rx_rings = 1, tx_rings = 2;
 	int retval;
 	uint16_t q;
 
@@ -87,6 +92,11 @@ struct Response {
     uint64_t runNs;
     uint64_t genNs;
 };
+#define TX_NUM 2
+struct th_tx_arg{
+	int pin_to_cpu;
+	int pin_tx_id;
+}tx_arg[TX_NUM];
 
  #define ntoh16(x)	(rte_be_to_cpu_16(x))
 #define ntoh32(x)	(rte_be_to_cpu_32(x))
@@ -96,21 +106,34 @@ struct Response {
 #define hton32(x)	(rte_cpu_to_be_32(x))
 #define hton64(x)	(rte_cpu_to_be_64(x))
 
-#define TX_SEND_NUM 100
-uint64_t tx_num = 0;
+uint64_t tx_num[TX_NUM] = { 0 };
 uint64_t rx_num = 0;
 struct rte_mempool *mbuf_pool;
-FILE *fp;
 void sigint_handler(int sig) {
-    printf("\npackets_sent: %lu\n", tx_num);
+    
+	for(int i = 1; i < rx_num; i++)
+	{
+		fwrite((void *)&rx_time[i], sizeof(uint64_t), 1, fp);
+	}
+	t2 = getCurNs();
+	t2 = (t2 - t1) / 1000000;
+	uint64_t all_tx_num = 0;
+	for(int i = 0; i < TX_NUM; i++) 
+	{
+		all_tx_num += tx_num[i];
+		printf("per  cpu tx is %d\n", tx_num[i]);
+	}
+	printf("send time is %llu ms\n", t2);
+	printf("pps is %lld\n", all_tx_num / t2);
+	printf("\npackets_sent: %lu\n", all_tx_num);
     printf("packets_received: %lu\n", rx_num);
-    fflush(stdout);
     syscall(SYS_exit_group, 0);
 }
-uint64_t t1, t2;
-void *pt_send(void *c)
+void *pt_send(void *tx_arg)
 {
-	pin_to_cpu(30);
+	struct th_tx_arg *arg = (struct th_tx_arg *)tx_arg;
+	printf("%d %d\n",arg->pin_to_cpu, arg->pin_tx_id);
+	pin_to_cpu(arg->pin_to_cpu);
 	struct rte_ether_addr s_addr = {{0xe4,0x43,0x4b,0xe6,0xbc,0x00}};
 	struct rte_ether_addr d_addr = {{0xe4,0x43,0x4b,0x76,0x27,0x96}};
 	uint16_t ether_type =hton16( 0x0800); 	
@@ -123,12 +146,17 @@ void *pt_send(void *c)
 
 	//对每个buf ， 给他们添加包
 	
-	struct rte_mbuf * pkt[BURST_SIZE];
+	struct rte_mbuf * pkt[2];
 	int i = 0;
+	t1 = getCurNs();
 	while(true)
 	{
-		t1 = getCurNs();
 		pkt[i] = rte_pktmbuf_alloc(mbuf_pool);
+		unsigned char *payload;
+		payload = (unsigned char *)((uint64_t)pkt[i] + 298);
+		struct Request *req = (struct Request *)payload;
+		req->genNs = getCurNs() + GENTIME;
+		req->runNs = 1000;
 		eth_hdr = rte_pktmbuf_mtod(pkt[i],struct ether_hdr*);
 		eth_hdr->dst_addr = d_addr;
 		eth_hdr->src_addr = s_addr;
@@ -153,17 +181,10 @@ void *pt_send(void *c)
 		udp_h->dst_port = hton16(1234);
 		udp_h->dgram_len = hton16(sizeof(struct Response) + sizeof(struct rte_udp_hdr));
 		udp_h->dgram_cksum = 0;
-		unsigned char *payload;
-		payload = (unsigned char *)((char *)udp_h + sizeof(*udp_h));
-		struct Request *req = (struct Request *)payload;
-	
-		req->genNs = getCurNs() + 1000;
-		req->runNs = 1000;
-		
-//		printf("genNs %d, runNs %d\n", req->genNs, req->runNs);
+
 		while(getCurNs() < req->genNs);
-		uint16_t nb_tx = rte_eth_tx_burst(0,0,pkt,1);
-		tx_num += nb_tx;
+		uint16_t nb_tx = rte_eth_tx_burst(0,arg->pin_tx_id,pkt,1);
+		tx_num[arg->pin_tx_id] += nb_tx;
 //		rte_pktmbuf_free(pkt[i]);
 
 	//	printf("tx_num %d\n", tx_num);
@@ -179,7 +200,7 @@ void *pt_send(void *c)
 
 void *pt_recv(void *c)
 {
-	pin_to_cpu(31);
+	pin_to_cpu(29);
 	struct rte_ether_hdr * eth_hdr;
 	struct rte_udp_hdr    *udp_h;
 	struct rte_ipv4_hdr   *ip_h;
@@ -204,7 +225,7 @@ void *pt_recv(void *c)
 		for(i=0;i<nb_rx;i++)
 		{
 			eth_hdr = rte_pktmbuf_mtod(pkt[i],struct rte_ether_hdr*);
-			num_rx++;
+			rx_num++;
 			#ifdef DEBUG
 			printf("收到包 来自MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8
 				   " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " : %d\n",
@@ -214,11 +235,12 @@ void *pt_recv(void *c)
 			#endif
 			resp = (struct Response *)((char *)eth_hdr + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr) + sizeof(struct rte_ether_hdr));
 			uint64_t time = getCurNs() - resp->genNs - 1000;
-			printf("%llu now %lld gen %lld\n",time, getCurNs(), resp->genNs);
+			rx_time[ rx_num%ARRAY_LENGTH ] = time;
+//			printf("%llu now %lld gen %lld\n",time, getCurNs(), resp->genNs);
 //			fwrite((void *)&time, sizeof(uint64_t), 1, fp);
 			rte_pktmbuf_free(pkt[i]);
 		}
-		rx_num += nb_rx;
+		
 	}
 }
 int main(int argc, char *argv[])
@@ -230,7 +252,7 @@ int main(int argc, char *argv[])
 		printf("open failed!\n");
 		return -1;
 	}
-	pthread_t receiver, sender;
+	pthread_t receiver, sender[TX_NUM];
 	/*进行总的初始话*/
 	int ret = rte_eal_init(argc, argv);
 	if (ret < 0)
@@ -256,10 +278,16 @@ int main(int argc, char *argv[])
 					0);
 	signal(SIGINT, sigint_handler);	
 
+	tx_arg[0].pin_to_cpu = 30;
+	tx_arg[0].pin_tx_id = 0;
+	tx_arg[1].pin_to_cpu = 31;
+	tx_arg[1].pin_tx_id = 1;
 	pthread_create(&receiver, NULL, pt_recv, NULL);
-	pthread_create(&sender, NULL, pt_send, NULL);
+	pthread_create(&sender[0], NULL, pt_send, &tx_arg);
+//	pthread_create(&sender[1], NULL, pt_send, &tx_arg[1]);
 	pthread_join(receiver, NULL);
-	pthread_join(sender, NULL);
+	pthread_join(sender[0], NULL);
+//	pthread_join(sender[1], NULL);
 	//自己定义的包头
 	
 
