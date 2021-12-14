@@ -15,7 +15,8 @@
 #include <signal.h>
 #define RX_RING_SIZE 128
 #define TX_RING_SIZE 512
-#define NUM_MBUFS 10000
+#define NUM_MBUFS (1 << 23)
+#define NUM_RX_MBUFS 8191
 #define MBUF_CACHE_SIZE 250
 #define BURST_SIZE 8
 #define ARRAY_LENGTH 10000000
@@ -51,7 +52,7 @@ static inline int
 port_init(struct rte_mempool *mbuf_pool)
 {
 	struct rte_eth_conf port_conf = port_conf_default;
-	const uint16_t rx_rings = 1, tx_rings = 2;
+	const uint16_t rx_rings = 1, tx_rings = 1;
 	int retval;
 	uint16_t q;
 
@@ -92,10 +93,11 @@ struct Response {
     uint64_t runNs;
     uint64_t genNs;
 };
-#define TX_NUM 2
+#define TX_NUM 1
 struct th_tx_arg{
 	int pin_to_cpu;
 	int pin_tx_id;
+	struct rte_mempool *mp;
 }tx_arg[TX_NUM];
 
  #define ntoh16(x)	(rte_be_to_cpu_16(x))
@@ -109,13 +111,14 @@ struct th_tx_arg{
 uint64_t tx_num[TX_NUM] = { 0 };
 uint64_t rx_num = 0;
 struct rte_mempool *mbuf_pool;
+struct rte_mempool *rx_mempool;
 void sigint_handler(int sig) {
     
 	for(int i = 1; i < rx_num; i++)
 	{
 		fwrite((void *)&rx_time[i], sizeof(uint64_t), 1, fp);
 	}
-	t2 = getCurNs();
+	if(t2 == 0) t2 = getCurNs();
 	t2 = (t2 - t1) / 1000000;
 	uint64_t all_tx_num = 0;
 	for(int i = 0; i < TX_NUM; i++) 
@@ -129,6 +132,7 @@ void sigint_handler(int sig) {
     printf("packets_received: %lu\n", rx_num);
     syscall(SYS_exit_group, 0);
 }
+struct rte_mbuf * pkt[10000000];
 void *pt_send(void *tx_arg)
 {
 	struct th_tx_arg *arg = (struct th_tx_arg *)tx_arg;
@@ -145,13 +149,16 @@ void *pt_send(void *tx_arg)
 
 
 	//对每个buf ， 给他们添加包
-	
-	struct rte_mbuf * pkt[2];
+	#define PACKET_NUM 4000000
+//	struct rte_mbuf * pkt[2];
 	int i = 0;
 	t1 = getCurNs();
-	while(true)
+
+	printf("%d\n",PACKET_NUM);
+	for(i = 0; i < PACKET_NUM; i++)
 	{
-		pkt[i] = rte_pktmbuf_alloc(mbuf_pool);
+		
+		pkt[i] = rte_pktmbuf_alloc(arg->mp);
 		unsigned char *payload;
 		payload = (unsigned char *)((uint64_t)pkt[i] + 298);
 		struct Request *req = (struct Request *)payload;
@@ -182,20 +189,33 @@ void *pt_send(void *tx_arg)
 		udp_h->dgram_len = hton16(sizeof(struct Response) + sizeof(struct rte_udp_hdr));
 		udp_h->dgram_cksum = 0;
 
-		while(getCurNs() < req->genNs);
-		uint16_t nb_tx = rte_eth_tx_burst(0,arg->pin_tx_id,pkt,1);
-		tx_num[arg->pin_tx_id] += nb_tx;
-//		rte_pktmbuf_free(pkt[i]);
-
+//		while(getCurNs() < req->genNs);
+//		uint16_t nb_tx = rte_eth_tx_burst(0,arg->pin_tx_id,pkt,1);
+//		tx_num[arg->pin_tx_id] += nb_tx;
 	//	printf("tx_num %d\n", tx_num);
 	}
-
+	printf("prepare finished!\n");
+	printf("input to start!");
+	if(getchar() == 'c') return;
+	t1 = getCurNs();
+	for(int i = 0; i < PACKET_NUM; i++)
+	{
+		unsigned char *payload;
+		payload = (unsigned char *)((uint64_t)pkt[i] + 298);
+		struct Request *req = (struct Request *)payload;
+		req->genNs = getCurNs() + GENTIME;
+		while(getCurNs() < req->genNs);
+		uint16_t nb_tx = rte_eth_tx_burst(0,arg->pin_tx_id,&pkt[i],1);
+		tx_num[arg->pin_tx_id] += nb_tx;
+	}	
+	t2 = getCurNs();
+	printf("%llu %llu %llu\n", t1, t2, t2 - t1);
 //	uint16_t nb_tx = rte_eth_tx_burst(0,0,pkt,BURST_SIZE);
 //	printf("发送成功%d个包\n",nb_tx);
 	//发送完成，答应发送了多少个
 	
-	for(i=0;i<BURST_SIZE;i++)
-		rte_pktmbuf_free(pkt[i]);
+//	for(i=0;i<BURST_SIZE;i++)
+//		rte_pktmbuf_free(pkt[i]);
 }
 
 void *pt_recv(void *c)
@@ -252,6 +272,8 @@ int main(int argc, char *argv[])
 		printf("open failed!\n");
 		return -1;
 	}
+	printf("mbuf :%d\n", sizeof(struct rte_mbuf));
+	printf("%d\n",RTE_MBUF_DEFAULT_BUF_SIZE);
 	pthread_t receiver, sender[TX_NUM];
 	/*进行总的初始话*/
 	int ret = rte_eal_init(argc, argv);
@@ -264,8 +286,10 @@ int main(int argc, char *argv[])
 
 	/* Creates a new mempool in memory to hold the mbufs. */
 	//分配内存池
-	mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS,
-		MBUF_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+	mbuf_pool = rte_pktmbuf_pool_create("TX0_POOL", NUM_MBUFS,
+		MBUF_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, SOCKET_ID_ANY);
+	rx_mempool = rte_pktmbuf_pool_create("RX0_POOL", NUM_RX_MBUFS,
+		MBUF_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, SOCKET_ID_ANY);
 
 	//如果创建失败
 	if (mbuf_pool == NULL)
@@ -273,15 +297,16 @@ int main(int argc, char *argv[])
 
 	/* Initialize all ports. */
 	//初始话端口设备 顺便给他们分配  队列
-		if (port_init(mbuf_pool) != 0)
+		if (port_init(rx_mempool) != 0)
 			rte_exit(EXIT_FAILURE, "Cannot init port %"PRIu8 "\n",
 					0);
 	signal(SIGINT, sigint_handler);	
-
+	printf("start work!\n");
 	tx_arg[0].pin_to_cpu = 30;
 	tx_arg[0].pin_tx_id = 0;
-	tx_arg[1].pin_to_cpu = 31;
-	tx_arg[1].pin_tx_id = 1;
+	tx_arg[0].mp = mbuf_pool;
+//	tx_arg[1].pin_to_cpu = 31;
+//	tx_arg[1].pin_tx_id = 1;
 	pthread_create(&receiver, NULL, pt_recv, NULL);
 	pthread_create(&sender[0], NULL, pt_send, &tx_arg);
 //	pthread_create(&sender[1], NULL, pt_send, &tx_arg[1]);
